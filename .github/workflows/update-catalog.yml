@@ -2,7 +2,7 @@ name: Aggiorna catalogo spiagge
 
 on:
   schedule:
-    - cron: "0 3 * * 1"      # ogni lunedì alle 3:00 UTC
+    - cron: "0 3 * * 1"      # ogni lunedi' alle 3:00 UTC
   workflow_dispatch:          # oppure a mano dal tab Actions
 
 permissions:
@@ -17,7 +17,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 350
+    outputs:
+      complete: ${{ steps.build.outputs.complete }}
     steps:
       - uses: actions/checkout@v4
 
@@ -25,13 +27,46 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Riprende il lavoro dei tentativi precedenti: i riquadri gia' fatti non
+      # vengono richiesti di nuovo a Overpass.
+      - name: Recupera il lavoro gia' fatto
+        uses: actions/cache/restore@v4
+        with:
+          path: cache
+          key: tiles-${{ github.run_id }}
+          restore-keys: tiles-
+
       - name: Genera il catalogo da OpenStreetMap
+        id: build
         run: |
+          set +e
           python3 Tools/build_catalog.py \
             --out dist \
+            --cache-dir cache \
+            --max-minutes 300 \
+            --sleep 6 \
             --base-url "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+          code=$?
+          set -e
+          if [ "$code" = "0" ]; then
+            echo "complete=true" >> "$GITHUB_OUTPUT"
+          elif [ "$code" = "2" ]; then
+            echo "complete=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Raccolta incompleta: rilancia il workflow per continuare."
+          else
+            exit $code
+          fi
+
+      # Salva SEMPRE, anche se la raccolta e' incompleta: e' tutto guadagnato.
+      - name: Salva il lavoro fatto
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: cache
+          key: tiles-${{ github.run_id }}
 
       - name: Controlli di sanita
+        if: steps.build.outputs.complete == 'true'
         run: |
           python3 - <<'PY'
           import json, sys
@@ -39,18 +74,21 @@ jobs:
           count = catalog["count"]
           print(f"{count} spiagge nel catalogo")
           if count < 500:
-              sys.exit(f"Troppo poche spiagge ({count}): probabile problema con Overpass, non pubblico.")
+              sys.exit(f"Troppo poche spiagge ({count}): non pubblico.")
           bad = [b for b in catalog["beaches"] if not 0 <= b["orientation"] <= 360]
           if bad:
               sys.exit(f"{len(bad)} orientamenti fuori range")
           PY
 
-      - uses: actions/upload-pages-artifact@v3
+      - name: Prepara la pubblicazione
+        if: steps.build.outputs.complete == 'true'
+        uses: actions/upload-pages-artifact@v3
         with:
           path: dist
 
   deploy:
     needs: build
+    if: needs.build.outputs.complete == 'true'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
