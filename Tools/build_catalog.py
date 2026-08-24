@@ -41,6 +41,9 @@ OVERPASS_ENDPOINTS = [
 DEFAULT_BBOX = (35.3, 6.4, 47.3, 18.7)  # south, west, north, east
 
 TILE_DEG = 1.0
+COAST_MARGIN = 0.15         # gradi di margine per la costa, cosi' le spiagge sul bordo
+                            # del riquadro trovano comunque la loro linea di costa
+ALGO_VERSION = 2            # cambiandolo si invalida la cache dei riquadri
 SEARCH_RADIUS_M = 800.0     # raggio entro cui cercare la costa attorno alla spiaggia
 MIN_CONFIDENCE = 0.25       # sotto questa soglia l'orientamento non e' affidabile
 DEDUPE_M = 120.0
@@ -120,7 +123,8 @@ def overpass(query, attempt=0):
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
         if attempt >= 4:
             raise
-        wait = 20 * (attempt + 1)
+        rate_limited = isinstance(error, urllib.error.HTTPError) and error.code == 429
+        wait = (75 if rate_limited else 20) * (attempt + 1)
         print(f"    ! {error} — riprovo fra {wait}s", file=sys.stderr)
         time.sleep(wait)
         return overpass(query, attempt + 1)
@@ -128,9 +132,11 @@ def overpass(query, attempt=0):
 
 def tile_query(south, west, north, east):
     box = f"{south},{west},{north},{east}"
+    coast = (f"{south - COAST_MARGIN},{west - COAST_MARGIN},"
+             f"{north + COAST_MARGIN},{east + COAST_MARGIN}")
     return f"""
 [out:json][timeout:240];
-way["natural"="coastline"]({box});
+way["natural"="coastline"]({coast});
 out geom;
 (
   node["natural"="beach"]({box});
@@ -220,11 +226,9 @@ SURFACE_MAP = {
 }
 
 
-def build_beach(beach, analysis, places):
+def build_beach(beach, analysis, places, include_unnamed=False):
     tags = beach["tags"]
     name = tags.get("name") or tags.get("name:it")
-    if not name:
-        return None
 
     area = ""
     best = 1e9
@@ -232,6 +236,14 @@ def build_beach(beach, analysis, places):
         distance = haversine(beach["lat"], beach["lon"], plat, plon)
         if distance < best and distance < 15000:
             best, area = distance, pname
+
+    if not name:
+        if not include_unnamed:
+            return None
+        # senza nome in OSM: la chiamiamo dal paese piu' vicino
+        name = f"Spiaggia presso {area}" if area else None
+        if not name:
+            return None
 
     labels = []
     if tags.get("sport") and "kitesurf" in tags["sport"]:
@@ -287,6 +299,42 @@ def dedupe(beaches):
     return kept
 
 
+# --------------------------------------------------------------------------- cache
+
+
+def tile_cache_path(cache_dir, tile):
+    south, west, _, _ = tile
+    name = f"tile_{south:+06.1f}_{west:+06.1f}.json".replace("+", "p").replace("-", "m")
+    return os.path.join(cache_dir, name)
+
+
+def load_tile_cache(cache_dir, tile):
+    """Ritorna i record gia' calcolati per questo riquadro, o None se da fare."""
+    if not cache_dir:
+        return None
+    path = tile_cache_path(cache_dir, tile)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (json.JSONDecodeError, OSError):
+        return None
+    if payload.get("algo") != ALGO_VERSION:
+        return None
+    return payload.get("beaches", [])
+
+
+def save_tile_cache(cache_dir, tile, beaches):
+    if not cache_dir:
+        return
+    os.makedirs(cache_dir, exist_ok=True)
+    payload = {"algo": ALGO_VERSION, "beaches": beaches,
+               "savedAt": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    with open(tile_cache_path(cache_dir, tile), "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False)
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -297,7 +345,13 @@ def main():
     parser.add_argument("--out", default="dist")
     parser.add_argument("--base-url", default="https://TUO-UTENTE.github.io/calagiusta-catalog",
                         help="URL pubblico dove verranno serviti i file")
-    parser.add_argument("--sleep", type=float, default=4.0)
+    parser.add_argument("--sleep", type=float, default=6.0)
+    parser.add_argument("--cache-dir", default="",
+                        help="Cartella dove salvare il lavoro fatto: permette di riprendere")
+    parser.add_argument("--max-minutes", type=float, default=0,
+                        help="Si ferma dopo N minuti salvando la cache. 0 = nessun limite")
+    parser.add_argument("--include-unnamed", action="store_true",
+                        help="Tiene anche le spiagge senza nome, chiamandole dal paese piu' vicino")
     arguments = parser.parse_args()
 
     south, west, north, east = arguments.bbox
@@ -312,30 +366,53 @@ def main():
             lon += TILE_DEG
         lat += TILE_DEG
 
+    cache_dir = arguments.cache_dir or ""
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+
+    deadline = time.time() + arguments.max_minutes * 60 if arguments.max_minutes > 0 else None
+    pending = []
+
     print(f"{len(tiles)} riquadri da interrogare")
-    for index, (s, w, n, e) in enumerate(tiles, 1):
+    for index, tile in enumerate(tiles, 1):
+        s, w, n, e = tile
+
+        cached = load_tile_cache(cache_dir, tile)
+        if cached is not None:
+            collected.extend(cached)
+            print(f"[{index}/{len(tiles)}] bbox {s:.0f},{w:.0f} → {len(cached)} spiagge (dalla cache)")
+            continue
+
+        if deadline and time.time() > deadline:
+            pending = tiles[index - 1:]
+            print(f"\n⏱  Tempo esaurito con {len(pending)} riquadri ancora da fare.")
+            print("   Il lavoro fatto e' salvato: rilancia per riprendere da qui.")
+            break
+
         print(f"[{index}/{len(tiles)}] bbox {s:.0f},{w:.0f} → ", end="", flush=True)
         try:
             payload = overpass(tile_query(s, w, n, e))
         except Exception as error:
+            # niente cache: al prossimo giro ci riprova
             print(f"saltato ({error})")
             continue
-        segments, beaches, places = parse_tile(payload)
-        if not beaches or not segments:
-            print(f"{len(beaches)} spiagge, {len(segments)} segmenti di costa — niente da fare")
-            time.sleep(arguments.sleep)
-            continue
 
-        added = 0
+        segments, beaches, places = parse_tile(payload)
+        records = []
         for beach in beaches:
             analysis = analyse(beach, segments)
             if not analysis or analysis["confidence"] < MIN_CONFIDENCE:
                 continue
-            record = build_beach(beach, analysis, places)
+            record = build_beach(beach, analysis, places, arguments.include_unnamed)
             if record:
-                collected.append(record)
-                added += 1
-        print(f"{added} spiagge valide su {len(beaches)}")
+                records.append(record)
+
+        save_tile_cache(cache_dir, tile, records)
+        collected.extend(records)
+        if not beaches or not segments:
+            print(f"{len(beaches)} spiagge, {len(segments)} segmenti di costa — niente da fare")
+        else:
+            print(f"{len(records)} spiagge valide su {len(beaches)}")
         time.sleep(arguments.sleep)
 
     collected = dedupe(collected)
@@ -368,6 +445,11 @@ def main():
     size = os.path.getsize(catalog_path) / 1024
     print(f"\n✓ {len(collected)} spiagge · {size:.0f} KB · versione {version}")
     print(f"  {catalog_path}")
+
+    if pending:
+        print(f"\n⚠  Raccolta INCOMPLETA: mancano {len(pending)} riquadri.")
+        print("   Rilancia lo stesso comando per continuare da dove si e' fermato.")
+        sys.exit(2)
 
 
 if __name__ == "__main__":
