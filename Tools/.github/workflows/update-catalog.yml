@@ -1,0 +1,60 @@
+name: Aggiorna catalogo spiagge
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"      # ogni lunedì alle 3:00 UTC
+  workflow_dispatch:          # oppure a mano dal tab Actions
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Genera il catalogo da OpenStreetMap
+        run: |
+          python3 Tools/build_catalog.py \
+            --out dist \
+            --base-url "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+
+      - name: Controlli di sanita
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          catalog = json.load(open("dist/catalog.json"))
+          count = catalog["count"]
+          print(f"{count} spiagge nel catalogo")
+          if count < 500:
+              sys.exit(f"Troppo poche spiagge ({count}): probabile problema con Overpass, non pubblico.")
+          bad = [b for b in catalog["beaches"] if not 0 <= b["orientation"] <= 360]
+          if bad:
+              sys.exit(f"{len(bad)} orientamenti fuori range")
+          PY
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
