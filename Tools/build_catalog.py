@@ -37,8 +37,21 @@ OVERPASS_ENDPOINTS = [
     "https://overpass.kumi.systems/api/interpreter",
 ]
 
-# Italia continentale + isole
-DEFAULT_BBOX = (35.3, 6.4, 47.3, 18.7)  # south, west, north, east
+# Regioni predefinite: (sud, ovest, nord, est)
+REGIONS = {
+    "italia":      (35.3, 6.4, 47.3, 18.7),   # penisola + Sicilia, Sardegna, isole minori
+    "spagna":      (35.9, -7.6, 43.9, 4.4),   # costa mediterranea + Baleari + Andalusia atlantica
+    "spagna-full": (35.9, -9.6, 44.0, 4.4),   # tutta la Spagna, si porta dietro il Portogallo
+    "grecia":      (34.7, 19.2, 41.8, 28.4),  # continente + Ionie, Cicladi, Dodecaneso, Creta
+    "croazia":     (42.2, 13.2, 45.9, 19.5),  # tutta la costa dalmata e l'Istria
+    "montenegro":  (41.8, 18.3, 43.6, 20.4),
+    "albania":     (39.6, 19.2, 42.1, 20.1),
+    "francia-med": (42.3, 2.9, 43.9, 7.8),    # Costa Azzurra + Linguadoca
+    "corsica":     (41.3, 8.5, 43.1, 9.6),
+    "canarie":     (27.5, -18.3, 29.6, -13.3),
+}
+
+DEFAULT_BBOX = REGIONS["italia"]
 
 TILE_DEG = 1.0
 COAST_MARGIN = 0.15         # gradi di margine per la costa, cosi' le spiagge sul bordo
@@ -340,8 +353,11 @@ def save_tile_cache(cache_dir, tile, beaches):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--regions", nargs="+", default=None,
+                        choices=sorted(REGIONS.keys()),
+                        help="Una o piu' regioni predefinite, es: --regions italia grecia croazia")
     parser.add_argument("--bbox", nargs=4, type=float, metavar=("S", "W", "N", "E"),
-                        default=list(DEFAULT_BBOX))
+                        default=None, help="Rettangolo personalizzato: sud ovest nord est")
     parser.add_argument("--out", default="dist")
     parser.add_argument("--base-url", default="https://TUO-UTENTE.github.io/calagiusta-catalog",
                         help="URL pubblico dove verranno serviti i file")
@@ -354,17 +370,35 @@ def main():
                         help="Tiene anche le spiagge senza nome, chiamandole dal paese piu' vicino")
     arguments = parser.parse_args()
 
-    south, west, north, east = arguments.bbox
+    boxes = []
+    if arguments.bbox:
+        boxes.append(tuple(arguments.bbox))
+    for name in (arguments.regions or []):
+        boxes.append(REGIONS[name])
+    if not boxes:
+        boxes.append(DEFAULT_BBOX)
+
     os.makedirs(arguments.out, exist_ok=True)
 
-    collected, tiles = [], []
-    lat = south
-    while lat < north:
-        lon = west
-        while lon < east:
-            tiles.append((lat, lon, min(lat + TILE_DEG, north), min(lon + TILE_DEG, east)))
-            lon += TILE_DEG
-        lat += TILE_DEG
+    # I riquadri si allineano alla griglia intera, cosi' due regioni che si
+    # sovrappongono (Italia e Croazia sull'Adriatico) condividono la stessa cache.
+    collected = []
+    seen = set()
+    tiles = []
+    for south, west, north, east in boxes:
+        lat = math.floor(south)
+        while lat < north:
+            lon = math.floor(west)
+            while lon < east:
+                key = (lat, lon)
+                if key not in seen:
+                    seen.add(key)
+                    tiles.append((float(lat), float(lon), lat + TILE_DEG, lon + TILE_DEG))
+                lon += TILE_DEG
+            lat += TILE_DEG
+
+    etichette = ", ".join(arguments.regions) if arguments.regions else "rettangolo personalizzato"
+    print(f"Regioni: {etichette}")
 
     cache_dir = arguments.cache_dir or ""
     if cache_dir:
