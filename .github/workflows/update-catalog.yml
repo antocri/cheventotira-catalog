@@ -42,6 +42,7 @@ jobs:
           set +e
           python3 Tools/build_catalog.py \
             --out dist \
+            --regions italia spagna grecia croazia montenegro \
             --cache-dir cache \
             --max-minutes 300 \
             --sleep 6 \
@@ -73,7 +74,7 @@ jobs:
           catalog = json.load(open("dist/catalog.json"))
           count = catalog["count"]
           print(f"{count} spiagge nel catalogo")
-          if count < 500:
+          if count < 2500:
               sys.exit(f"Troppo poche spiagge ({count}): non pubblico.")
           bad = [b for b in catalog["beaches"] if not 0 <= b["orientation"] <= 360]
           if bad:
